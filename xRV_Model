@@ -1,0 +1,698 @@
+library(dplyr)
+library(baseballr)
+library(Boruta)
+library(caTools)
+library(ranger)
+library(ggplot2)
+library(Metrics)
+library(scales)
+library(psych)
+
+set.seed(123)
+
+#savantData is a stored csv of statcast play by play data since 2016
+savantData <- read_csv("SavantData.csv")
+#data prep/cleaning
+#add in a count variable
+savantData <- savantData %>% 
+  mutate(count = paste(balls, strikes, 
+               sep = "-"))
+
+#check weird cases
+badCounts <- c("1-3", "4-1", "4-2")
+
+#remove odd cases
+pitches <- savantData %>% 
+  filter(!(count %in% badCounts))
+
+#add pitcher/batter names
+mlbplayerids <- baseballr::get_chadwick_lu()
+
+savantIDS <- mlbplayerids %>% 
+  select(key_mlbam, name_first, name_last) %>% 
+  mutate(name = paste(name_first, name_last, sep = " ")) %>% 
+  filter(!is.na(key_mlbam))
+
+#batter names
+pitches <- left_join(pitches, savantIDS, by = c("batter" = "key_mlbam")) %>% 
+  select(-name_first, -name_last) %>% 
+  rename(batter_name = name)
+
+#pitcher names
+pitches <- left_join(pitches, savantIDS, by = c("pitcher" = "key_mlbam")) %>% 
+  select(-name_first, -name_last) %>% 
+  rename(pitcher_name = name)
+
+
+#distribution of run expectancy
+ggplot(pitches, aes(x = delta_run_exp)) +
+  geom_histogram() +
+  xlim(-0.5, 0.5)
+
+#find all pitch types and get rid of uncommon ones/rename
+pitches %>% 
+  select(pitch_type, pitch_name) %>% 
+  unique() %>% 
+  View()
+
+pitches <- pitches %>% 
+  filter(!(pitch_type %in% c("PO", "FO", "EP", "SC", "", NA, "UN", "XX", "KN", "IN")))
+
+#make all righty x numbers positive
+pitches2 <- pitches %>% 
+  mutate(
+    release_pos_x_adj = ifelse(p_throws == "R", -release_pos_x, release_pos_x),
+    pfx_x_adj = ifelse(p_throws == "R", -pfx_x, pfx_x)
+  )
+
+#original
+pitches %>% 
+  select(pitcher_name, p_throws, pfx_x, release_pos_x) %>% 
+  group_by(pitcher_name, p_throws) %>% 
+  summarise(pfx_x = mean(pfx_x), release_pos_x = mean(release_pos_x)) %>% 
+  View()
+
+#new
+pitches2 %>% 
+  select(pitcher_name, p_throws, pfx_x_adj, release_pos_x_adj) %>% 
+  group_by(pitcher_name, p_throws) %>% 
+  summarise(pfx_x_adj = mean(pfx_x_adj), release_pos_x_adj = mean(release_pos_x_adj)) %>% 
+  View()
+
+#fastball average for each pitcher
+ff_pitchers <- pitches2 %>%
+  filter(pitch_type %in% c("FF", "SI", "FA", "FT")) %>% 
+  group_by(pitcher_name, game_year) %>% 
+  summarise(avg_ff_velo = mean(release_speed, na.rm = TRUE),
+            avg_ff_mov_x = mean(pfx_x, na.rm = TRUE),
+            avg_ff_mov_z = mean(pfx_z, na.rm = TRUE))
+
+#avg cutter stats for cutter prominent pitchers
+fc_pitchers <- pitches2 %>%
+  filter(pitch_type %in% c("FC")) %>% 
+  group_by(pitcher_name, game_year) %>% 
+  summarise(avg_ff_velo = mean(release_speed, na.rm = TRUE),
+            avg_ff_mov_x = mean(pfx_x, na.rm = TRUE),
+            avg_ff_mov_z = mean(pfx_z, na.rm = TRUE))
+  
+#join to main dataset
+pitches3 <- left_join(pitches2, ff_pitchers, by = c("pitcher_name", "game_year"))
+
+#get pitchers who are missing averages
+extra <- pitches3 %>% 
+  filter(is.na(avg_ff_velo)) %>% 
+  select(pitcher_name, game_year) %>% 
+  unique() 
+
+
+extra <- extra %>% 
+  mutate(val = paste(pitcher_name, as.character(game_year))) %>% 
+  select(val) %>% 
+  as.vector()
+
+#only add in cutters for nas
+fc_pitchers <- fc_pitchers %>% 
+  mutate(val = paste(pitcher_name, as.character(game_year))) %>% 
+  filter(val %in% extra$val) %>% 
+  select(-val)
+
+#rbind cutters to other fastballs
+ff_pitchers <- rbind(ff_pitchers, fc_pitchers)
+
+#join all fastballs this time
+pitches4 <- left_join(pitches2, ff_pitchers, by = c("pitcher_name", "game_year"))
+
+#filter out pitchers with missing ff info
+pitches4 <- pitches4 %>% 
+  filter(!is.na(avg_ff_velo))
+
+View(pitches4)
+
+#add in velo differences
+pitches5 <- pitches4 %>% 
+  mutate(velo_diff = ifelse(pitch_type %in% c("SL", "CU", "FS", "KC", "CH", "FC", "SI"), release_speed - avg_ff_velo, NA),
+    pfx_x_diff = ifelse(pitch_type %in% c("SL", "CU", "FS", "KC", "CH", "FC", "SI"), pfx_x - avg_ff_mov_x, NA),
+    pfx_z_diff = ifelse(pitch_type %in% c("SL", "CU", "FS", "KC", "CH", "FC", "SI"), pfx_z - avg_ff_mov_z, NA))
+
+View(pitches5)
+
+rv_per_pitch <- pitches5 %>% 
+  #drop deprecated columns
+  select(-spin_dir, -spin_rate_deprecated, -break_angle_deprecated, -break_length_deprecated) %>% 
+  ungroup()
+
+
+#adjust for special cases of run value
+#most nas are because there is no event after
+#num nas
+sum(is.na(rv_per_pitch$delta_run_exp)) #about 6% of data
+
+#remove nas and rename delta_run_exp to run_value
+rv_per_pitch_final <- rv_per_pitch %>% 
+  filter(!is.na(delta_run_exp)) %>% 
+  rename(run_value = delta_run_exp)
+
+#get rid of dfs 
+rm(pitches, pitches2, pitches3, pitches4, pitches5, extra, fc_pitchers, ff_pitchers, rv_per_pitch)
+
+#sanity check, roll yankees
+rv_per_pitch_final %>%
+  filter(game_date == "2016-06-24", home_team == "NYY") %>% 
+  group_by(game_pk, inning, inning_topbot) %>% 
+  arrange(-desc(sv_id)) %>% 
+  select(des, description, events, inning, outs_when_up, run_value, count, balls, strikes) %>% 
+  View()
+
+#check for other na inputs, prob filter them out
+sum(is.na(rv_per_pitch_final$release_spin_rate))
+sum(is.na(rv_per_pitch_final$release_speed))
+sum(is.na(rv_per_pitch_final$pfx_x_diff)) #should be a lot for this
+sum(is.na(rv_per_pitch_final$pfx_z))
+sum(is.na(rv_per_pitch_final$plate_x))
+sum(is.na(rv_per_pitch_final$run_value))
+
+#remove nas
+rv_per_pitch_final <- rv_per_pitch_final %>% 
+  filter(!is.na(release_spin_rate), !is.na(release_extension), !is.na(release_speed), !is.na(pfx_x))
+
+#write feature selection function to find which features to use
+feature_select <- function(pbp) {
+  
+  if(unique(pbp$pitch_type %in% c("FF", "SI", "FA", "FT"))) {
+    
+    data = pbp %>%
+      filter(p_throws == "R", stand =="R")
+    
+    data_sample <- data[sample(nrow(data), size = nrow(data)*.3),]
+    
+    Boruta_PitchType <- Boruta(run_value ~ release_speed + release_pos_x_adj + release_extension+
+                              release_pos_z + pfx_x_adj + pfx_z + plate_x + plate_z + release_spin_rate,#+ velo_diff + pfx_x_diff + pfx_z_diff,
+                               data = data_sample)
+    
+    #print(Boruta_PitchType)
+    #plot(Boruta_PitchType)
+    
+    feature_importance <- data.frame(attStats(Boruta_PitchType))
+    
+    feature_importance %>%
+      select(meanImp, decision)%>%
+      arrange(desc(meanImp)) 
+    
+    Features <- getSelectedAttributes(Boruta_PitchType, withTentative = F) #return the list of confirmed important variables for use in the model
+    
+    return(Features)
+    
+  }
+  
+  else {
+    
+    data = pbp %>%
+      filter(p_throws == "R", stand =="R") 
+    
+    data_sample = data[sample(nrow(data), size = nrow(data)*.3),]
+    
+    Boruta_PitchType <- Boruta(run_value ~ release_speed + release_pos_x_adj + release_extension +
+                                 release_pos_z + pfx_x_adj + pfx_z + plate_x + plate_z + release_spin_rate +
+                                 velo_diff + pfx_x_diff + pfx_z_diff, 
+                               data = data_sample)
+    
+    #print(Boruta_PitchType)
+    #plot(Boruta_PitchType)
+    
+    feature_importance <- data.frame(attStats(Boruta_PitchType))
+    
+    feature_importance %>%
+      select(meanImp, decision)%>%
+      arrange(desc(meanImp)) 
+    
+    Features <- getSelectedAttributes(Boruta_PitchType, withTentative = F) #return the list of confirmed important variables for use in the model
+    
+    return(Features)
+    
+  }
+}
+
+#get features
+#Fastballs
+ff_data <- rv_per_pitch_final %>% 
+  filter(pitch_type == "FF")
+
+FF_features <- feature_select(ff_data)
+
+#hard coded for time purposes
+FF_features <- c("release_speed","release_pos_x_adj","release_extension",
+                   "release_pos_z","pfx_x_adj","pfx_z","plate_x","plate_z")
+
+
+#Sinkers
+si_data <- rv_per_pitch_final%>%
+  filter(pitch_type == "SI")
+
+SI_features <- feature_select(si_data)
+
+SI_features <- c("release_speed","release_pos_x_adj","release_extension",
+                 "release_pos_z","pfx_x_adj","pfx_z","plate_x","plate_z","velo_diff", "pfx_x_diff",
+                 'pfx_z_diff')
+
+#Cutters
+fc_data <- rv_per_pitch_final%>%
+  filter(pitch_type == "FC")
+
+FC_features <- feature_select(fc_data)
+
+FC_features <- c("release_speed","release_pos_x_adj","release_extension",
+                 "release_pos_z","pfx_x_adj","pfx_z","plate_x","plate_z","velo_diff", "pfx_x_diff",
+                 'pfx_z_diff')
+
+#CHANGEUPS AND SPLITTERS
+ch_data <- rv_per_pitch_final%>%
+  filter(pitch_type %in% c("CH", "FS"))
+
+CH_features <- feature_select(ch_data)
+
+CH_features <- c("release_speed","release_pos_x_adj","release_extension",
+                 "release_pos_z","pfx_x_adj","pfx_z","plate_x","plate_z","velo_diff", "pfx_x_diff",
+                 'pfx_z_diff')
+
+#SLIDERS
+sl_data <- rv_per_pitch_final%>%
+  filter(pitch_type == "SL")
+
+SL_features <- feature_select(sl_data)
+
+
+SL_features <- c("release_speed","release_pos_x_adj","release_extension",
+                 "release_pos_z","pfx_x_adj","pfx_z","plate_x","plate_z","velo_diff", "pfx_x_diff",
+                 'pfx_z_diff')
+
+#CURVEBALLS AND KNUCKLE CURVES
+#need !is.na to get rid of position players
+cb_data <- rv_per_pitch_final%>%
+  filter(pitch_type %in% c("CU", "KC"), !is.na(velo_diff))
+
+CB_features = feature_select(cb_data)
+
+
+CB_features <- c("release_speed","release_pos_x_adj","release_extension",
+                 "release_pos_z","pfx_x_adj","pfx_z","plate_x","plate_z","velo_diff", "pfx_x_diff",
+                 'pfx_z_diff')
+
+getActualFeatures <- function(pbp, features) {
+  features1 <- append(features, c("run_value"))
+  df1 <- pbp[,features1]
+  
+  return(df1)
+  
+}
+
+rm(data_train1)
+#MODELING
+#fastball model
+memory.limit(size = 100000)
+
+ff_preds <- run_model(ff_data, FF_features)
+ff_data <- add_xRV(ff_data, ff_preds)
+
+#store to csv
+write_csv(ff_data, "ff_xRV.csv")
+
+#checks
+cor(ff_data$run_value, ff_data$xRV)^2
+
+ff_pitcher_years <- ff_data %>% 
+  group_by(pitcher_name,pitcher, game_year) %>%
+  summarise(pitches = n(), rv_per_100 = 100 * sum(run_value, na.rm = TRUE) / pitches, 
+            xRV_per_100 = 100 * sum(xRV, na.rm = TRUE) / pitches) %>% 
+  ungroup() %>% 
+  mutate(xRV_plus = round(as.numeric(rescale(-xRV_per_100, mean = 100, sd=50, df = F)),2))
+
+#add pitch type column
+ff_pitcher_years$pitch_type <- "FF"
+
+write_csv(ff_pitcher_years, "ff_pitchers.csv")
+
+#sinker model
+si_data <- rv_per_pitch_final %>%
+  filter(pitch_type == "SI")
+
+si_preds <- run_model(si_data, SI_features)
+si_data <- add_xRV(si_data, si_preds)
+
+#store to csv
+write_csv(si_data, "si_xRV.csv")
+
+#checks
+cor(si_data$run_value, si_data$xRV)^2
+
+si_pitcher_years <- si_data %>% 
+  group_by(pitcher_name,pitcher, game_year) %>%
+  summarise(pitches = n(), rv_per_100 = 100 * sum(run_value, na.rm = TRUE) / pitches, 
+            xRV_per_100 = 100 * sum(xRV, na.rm = TRUE) / pitches) %>% 
+  ungroup() %>% 
+  mutate(xRV_plus = round(as.numeric(rescale(-xRV_per_100, mean = 100, sd=50, df = F)),2))
+
+si_pitcher_years$pitch_type <- "SI"
+
+write_csv(si_pitcher_years, "si_pitchers.csv")
+
+#cutter model
+fc_data <- rv_per_pitch_final %>%
+  filter(pitch_type == "FC")
+
+fc_preds <- run_model(fc_data, FC_features)
+fc_data <- add_xRV(fc_data, fc_preds)
+
+#store to csv
+write_csv(fc_data, "fc_xRV.csv")
+
+#checks
+cor(fc_data$run_value, fc_data$xRV)^2
+
+fc_pitcher_years <- fc_data %>% 
+  group_by(pitcher_name,pitcher, game_year) %>%
+  summarise(pitches = n(), rv_per_100 = 100 * sum(run_value, na.rm = TRUE) / pitches, 
+            xRV_per_100 = 100 * sum(xRV, na.rm = TRUE) / pitches) %>% 
+  ungroup() %>% 
+  mutate(xRV_plus = round(as.numeric(rescale(-xRV_per_100, mean = 100, sd=50, df = F)),2)) 
+
+fc_pitcher_years$pitch_type <- "FC"
+
+write_csv(fc_pitcher_years, "fc_pitchers.csv")
+
+#changeup model
+ch_data <- rv_per_pitch_final %>%
+  filter(pitch_type %in% c("CH", "FS"))
+
+ch_preds <- run_model(ch_data, CH_features)
+ch_data <- add_xRV(ch_data, ch_preds)
+
+#store to csv
+write_csv(ch_data, "ch_xRV.csv")
+
+#checks
+cor(ch_data$run_value, ch_data$xRV)^2
+
+ch_pitcher_years <- ch_data %>% 
+  group_by(pitcher_name,pitcher, game_year) %>%
+  summarise(pitches = n(), rv_per_100 = 100 * sum(run_value, na.rm = TRUE) / pitches, 
+            xRV_per_100 = 100 * sum(xRV, na.rm = TRUE) / pitches) %>% 
+  ungroup() %>% 
+  mutate(xRV_plus = round(as.numeric(rescale(-xRV_per_100, mean = 100, sd=50, df = F)),2)) 
+
+ch_pitcher_years$pitch_type <- "CH"
+
+write_csv(ch_pitcher_years, "ch_pitchers.csv")
+
+
+#curveball model
+cu_data <- rv_per_pitch_final %>%
+  filter(pitch_type %in% c("CU", "KC"))
+
+cu_preds <- run_model(cu_data, CB_features)
+cu_data <- add_xRV(cu_data, cu_preds)
+
+#store to csv
+write_csv(cu_data, "cu_xRV.csv")
+
+#checks
+cor(cu_data$run_value, cu_data$xRV)^2
+
+cu_pitcher_years <- cu_data %>% 
+  group_by(pitcher_name,pitcher, game_year) %>%
+  summarise(pitches = n(), rv_per_100 = 100 * sum(run_value, na.rm = TRUE) / pitches, 
+            xRV_per_100 = 100 * sum(xRV, na.rm = TRUE) / pitches) %>% 
+  ungroup() %>% 
+  mutate(xRV_plus = round(as.numeric(rescale(-xRV_per_100, mean = 100, sd=50, df = F)),2)) 
+
+cu_pitcher_years$pitch_type <- "CU"
+
+write_csv(cu_pitcher_years, "cu_pitchers.csv")
+
+View(cu_pitcher_years)
+
+#slider model
+sl_data <- rv_per_pitch_final %>%
+  filter(pitch_type %in% c("SL"))
+
+sl_preds <- run_model(sl_data, SL_features)
+sl_data <- add_xRV(sl_data, sl_preds)
+
+#store to csv
+write_csv(sl_data, "sl_xRV.csv")
+
+#checks
+cor(sl_data$run_value, sl_data$xRV)^2
+
+sl_pitcher_years <- sl_data %>% 
+  group_by(pitcher_name,pitcher, game_year) %>%
+  summarise(pitches = n(), rv_per_100 = 100 * sum(run_value, na.rm = TRUE) / pitches, 
+            xRV_per_100 = 100 * sum(xRV, na.rm = TRUE) / pitches) %>% 
+  ungroup() %>% 
+  mutate(xRV_plus = round(as.numeric(rescale(-xRV_per_100, mean = 100, sd=50, df = F)),2)) 
+
+sl_pitcher_years$pitch_type <- "SL"
+
+write_csv(sl_pitcher_years, "sl_pitchers.csv")
+
+View(sl_pitcher_years)
+
+#BIND ALL DATA TOGETHER
+xRV_pbp <- rbind(ff_data, si_data, ch_data, fc_data, cu_data, sl_data)
+xRV_pitcher_years <- rbind(ff_pitcher_years, si_pitcher_years, fc_pitcher_years, ch_pitcher_years, cu_pitcher_years, sl_pitcher_years)
+
+write_csv(xRV_pbp, "xRV_pbp_8_18.csv")
+write_csv(xRV_pitcher_years, "xRV_pitcher_years_8_18.csv")
+
+View(xRV_pitcher_years)
+
+#function to run model
+run_model <- function(pbp, features) {
+  
+    #filter for handedness  
+    pbp1 <- pbp %>% 
+      filter(p_throws == "R", stand == "R")
+    
+    #select only features
+    data_model1 <- as.data.frame(getActualFeatures(pbp1, features))
+    
+    #train/test data
+    #get training data
+    sample1 <- sample(c(TRUE, FALSE), nrow(data_model1), replace=TRUE, prob=c(0.8,0.2))
+    
+    data_train1 <- as.data.frame(data_model1[sample1, ])
+    
+    data_test1 <- as.data.frame(data_model1[!sample1, ])
+    
+    #NOTE: CURRENT MODEL TRAIN RMSE IS HIGHER THAN TEST RMSE BY A BIT // FIX!!
+    model1 <- ranger::ranger(
+      run_value ~ .,
+      data = data_train1,
+      importance = "impurity",
+      num.trees = 750
+    )
+    
+    print(model1) 
+        
+    model_var_imp1 <- as.data.frame(importance(model1))
+    model_var_imp1$variables <- row.names(model_var_imp1)
+    
+    #make importance a %
+    model_var_imp1 <- model_var_imp1 %>% 
+      mutate(importance_perc = importance(model1) / sum(importance(model1)))
+    
+    #var importance
+    print(ggplot(model_var_imp1, aes(x=reorder(variables,importance_perc), y=importance_perc,fill=importance_perc))+ 
+      geom_bar(stat="identity", position="dodge")+ coord_flip()+
+      ylab("Variable Importance")+
+      xlab("")+
+      ggtitle("Information Value Summary")+
+      #guides()+
+      scale_fill_gradient(low="red", high="blue"))
+    
+    data_preds1 <- predict(model1, data_model1)
+    
+    df1 <- cbind(data_model1, data_preds1$predictions)
+    
+    df1 <- df1 %>% 
+      rename(predictions = "data_preds1$predictions")
+    
+    #print rmse 
+    print("RMSE:")
+    print(Metrics::rmse(df1$run_value, df1$predictions))
+    
+    pbp2 <- pbp %>% 
+      filter(p_throws == "R", stand == "L")
+    
+    #select only features
+    data_model2 <- as.data.frame(getActualFeatures(pbp2, features))
+    
+    #train/test data
+    #get training data
+    sample2 <- sample(c(TRUE, FALSE), nrow(data_model2), replace=TRUE, prob=c(0.8,0.2))
+    
+    data_train2 <- as.data.frame(data_model2[sample2, ])
+    
+    data_test2 <- as.data.frame(data_model2[!sample2, ])
+    
+    #NOTE: CURRENT MODEL TRAIN RMSE IS HIGHER THAN TEST RMSE BY A BIT // FIX!!
+    model2 <- ranger::ranger(
+      run_value ~ .,
+      data = data_train2,
+      importance = "impurity",
+      num.trees = 750
+    )
+    
+    print(model2) 
+    
+    model_var_imp2 <- as.data.frame(importance(model2))
+    model_var_imp2$variables <- row.names(model_var_imp2)
+    
+    #make importance a %
+    model_var_imp2 <- model_var_imp2 %>% 
+      mutate(importance_perc = importance(model2) / sum(importance(model2)))
+    
+    #var importance
+    print(ggplot(model_var_imp2, aes(x=reorder(variables,importance_perc), y=importance_perc,fill=importance_perc))+ 
+            geom_bar(stat="identity", position="dodge")+ coord_flip()+
+            ylab("Variable Importance")+
+            xlab("")+
+            ggtitle("Information Value Summary")+
+            #guides()+
+            scale_fill_gradient(low="red", high="blue"))
+    
+    data_preds2 <- predict(model2, data_model2)
+    
+    df2 <- cbind(data_model2, data_preds2$predictions)
+    
+    df2 <- df2 %>% 
+      rename(predictions = "data_preds2$predictions")
+    
+    #print rmse 
+    print("RMSE:")
+    print(Metrics::rmse(df2$run_value, df2$predictions))
+    
+    
+    pbp3 <- pbp %>% 
+      filter(p_throws == "L", stand == "R")
+    
+    #select only features
+    data_model3 <- as.data.frame(getActualFeatures(pbp3, features))
+    
+    #train/test data
+    #get training data
+    sample3 <- sample(c(TRUE, FALSE), nrow(data_model3), replace=TRUE, prob=c(0.8,0.2))
+    
+    data_train3 <- as.data.frame(data_model3[sample3, ])
+    
+    data_test3 <- as.data.frame(data_model3[!sample3, ])
+    
+    #NOTE: CURRENT MODEL TRAIN RMSE IS HIGHER THAN TEST RMSE BY A BIT // FIX!!
+    model3 <- ranger::ranger(
+      run_value ~ .,
+      data = data_train3,
+      importance = "impurity",
+      num.trees = 750
+    )
+    
+    print(model3) 
+    
+    model_var_imp3 <- as.data.frame(importance(model3))
+    model_var_imp3$variables <- row.names(model_var_imp3)
+    
+    #make importance a %
+    model_var_imp3 <- model_var_imp3 %>% 
+      mutate(importance_perc = importance(model3) / sum(importance(model3)))
+    
+    #var importance
+    print(ggplot(model_var_imp3, aes(x=reorder(variables,importance_perc), y=importance_perc,fill=importance_perc))+ 
+            geom_bar(stat="identity", position="dodge")+ coord_flip()+
+            ylab("Variable Importance")+
+            xlab("")+
+            ggtitle("Information Value Summary")+
+            #guides()+
+            scale_fill_gradient(low="red", high="blue"))
+    
+    data_preds3 <- predict(model3, data_model3)
+    
+    df3 <- cbind(data_model3, data_preds3$predictions)
+    
+    df3 <- df3 %>% 
+      rename(predictions = "data_preds3$predictions")
+    
+    #print rmse 
+    print("RMSE:")
+    print(Metrics::rmse(df3$run_value, df3$predictions))
+    
+    pbp4 <- pbp %>% 
+      filter(p_throws == "L", stand == "L")
+    
+    #select only features
+    data_model4 <- as.data.frame(getActualFeatures(pbp4, features))
+    
+    #train/test data
+    #get training data
+    sample4 <- sample(c(TRUE, FALSE), nrow(data_model4), replace=TRUE, prob=c(0.8,0.2))
+    
+    data_train4 <- as.data.frame(data_model4[sample4, ])
+    
+    data_test4 <- as.data.frame(data_model4[!sample4, ])
+    
+    #NOTE: CURRENT MODEL TRAIN RMSE IS HIGHER THAN TEST RMSE BY A BIT // FIX!!
+    model4 <- ranger::ranger(
+      run_value ~ .,
+      data = data_train4,
+      importance = "impurity",
+      num.trees = 750
+    )
+    
+    print(model4) 
+    
+    model_var_imp4 <- as.data.frame(importance(model4))
+    model_var_imp4$variables <- row.names(model_var_imp4)
+    
+    #make importance a %
+    model_var_imp4 <- model_var_imp4 %>% 
+      mutate(importance_perc = importance(model4) / sum(importance(model4)))
+    
+    #var importance
+    print(ggplot(model_var_imp4, aes(x=reorder(variables,importance_perc), y=importance_perc,fill=importance_perc))+ 
+            geom_bar(stat="identity", position="dodge")+ coord_flip()+
+            ylab("Variable Importance")+
+            xlab("")+
+            ggtitle("Information Value Summary")+
+            #guides()+
+            scale_fill_gradient(low="red", high="blue"))
+    
+    data_preds4 <- predict(model4, data_model4)
+    
+    df4 <- cbind(data_model4, data_preds4$predictions)
+    
+    df4 <- df4 %>% 
+      rename(predictions = "data_preds4$predictions")
+    
+    #print rmse 
+    print("RMSE:")
+    print(Metrics::rmse(df4$run_value, df4$predictions))
+    
+    df <- rbind(df1, df2, df3, df4)
+    
+    return(as.data.frame(df))
+}
+
+#function to join xRV
+add_xRV <- function(pbp, preds) {
+  
+  if(unique(pbp$pitch_type) == ("FF")) {
+  
+  pbp <- left_join(pbp, preds, by = c("release_speed", "release_pos_x_adj", "release_extension", "release_pos_z",
+                                      "pfx_x_adj", "pfx_z", "plate_x", "plate_z", "run_value")) %>% 
+    rename(xRV = "predictions") 
+  
+  }
+  else{
+    pbp <- left_join(pbp, preds, by = c("release_speed", "release_pos_x_adj", "release_extension", "release_pos_z",
+                                        "pfx_x_adj", "pfx_z", "plate_x", "plate_z", "run_value", "velo_diff", 
+                                        "pfx_x_diff", "pfx_z_diff")) %>% 
+      rename(xRV = "predictions") 
+  }
+}
